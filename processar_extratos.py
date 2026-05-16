@@ -53,16 +53,59 @@ def _style_data_row(ws, row_idx, ncols, alt=False):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _clean_valor(series):
-    """Converte para numérico, trata strings com vírgula e R$."""
-    return (
-        series.astype(str)
-        .str.replace("R$", "", regex=False)
-        .str.replace(".", "", regex=False)
-        .str.replace(",", ".", regex=False)
-        .str.strip()
-        .pipe(pd.to_numeric, errors="coerce")
-        .fillna(0)
-    )
+    """
+    Converte série para numérico tratando formato BR (1.234,56) e US (1234.56).
+    Também trata células já numéricas (float/int) vindas direto do Excel.
+    """
+    # Se já for numérico (Excel leu como número), devolve direto
+    if pd.api.types.is_numeric_dtype(series):
+        return series.fillna(0)
+
+    s = series.astype(str).str.strip()
+    s = s.str.replace(r"\s", "", regex=True)   # espaços internos
+    s = s.str.replace("R$", "", regex=False)
+    s = s.str.replace("\xa0", "", regex=False)  # non-breaking space
+
+    # Detecta formato BR: tem ponto de milhar E vírgula decimal  → 1.234,56
+    # ou só vírgula decimal → 1234,56
+    # Formato US: só ponto decimal → 1234.56
+    has_dot_and_comma = s.str.contains(r"\d\.\d{3},", regex=True)
+    has_only_comma    = s.str.contains(r",") & ~s.str.contains(r"\.")
+
+    # Formato BR: remove ponto, troca vírgula por ponto
+    br_mask = has_dot_and_comma | has_only_comma
+    s_br = s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    s_us = s.str.replace(",", "", regex=False)  # remove separador de milhar US
+
+    # Aplica conversão: BR onde br_mask, senão tenta US
+    s_final = s.copy()
+    s_final[br_mask]  = s_br[br_mask]
+    s_final[~br_mask] = s_us[~br_mask]
+    return pd.to_numeric(s_final, errors="coerce").fillna(0)
+
+
+def _find_col(cols, *keywords):
+    """
+    Procura a primeira coluna cujo nome (string) contenha qualquer keyword.
+    Ignora colunas cujo nome seja NaN/float.
+    Retorna None se não encontrar.
+    """
+    str_cols = [c for c in cols if isinstance(c, str)]
+    for kw in keywords:
+        match = next((c for c in str_cols if kw in c.lower()), None)
+        if match:
+            return match
+    return None
+
+
+def _get_col(df, *keywords, default=None):
+    """Retorna a Series da coluna encontrada, ou uma Series de zeros/vazia."""
+    col = _find_col(df.columns, *keywords)
+    if col:
+        return df[col]
+    if default is not None:
+        return pd.Series([default] * len(df), index=df.index)
+    return pd.Series([""] * len(df), index=df.index)
 
 
 def normalizar_c6(df_raw: pd.DataFrame) -> pd.DataFrame:
@@ -74,16 +117,16 @@ def normalizar_c6(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_raw.copy()
     df.columns = df.columns.str.strip()
 
-    # Aceita variações de nome de coluna
-    data_col = next((c for c in df.columns if "lança" in c.lower() or "data" in c.lower()), df.columns[0])
+    data_col = _find_col(df.columns, "lança", "data") or df.columns[0]
     df["Data Lançamento"] = pd.to_datetime(df[data_col], dayfirst=True, errors="coerce")
 
-    titulo = df.get("Título", df.get("Titulo", pd.Series([""] * len(df)))).fillna("").astype(str).str.strip()
-    descr  = df.get("Descrição", df.get("Descricao", pd.Series([""] * len(df)))).fillna("").astype(str).str.strip()
-    df["DESCRIÇÃO"] = titulo.where(titulo == descr, titulo + " | " + descr).str.strip(" |")
+    titulo = _get_col(df, "título", "titulo").fillna("").astype(str).str.strip()
+    descr  = _get_col(df, "descriç", "descric").fillna("").astype(str).str.strip()
+    df["DESCRIÇÃO"] = (titulo + " | " + descr).str.strip(" |")
+    df["DESCRIÇÃO"] = df["DESCRIÇÃO"].str.replace(r"^\s*\|\s*|\s*\|\s*$", "", regex=True)
 
-    df["Entrada(R$)"] = _clean_valor(df.get("Entrada(R$)", pd.Series([0]*len(df))))
-    df["Saída(R$)"]   = _clean_valor(df.get("Saída(R$)",   pd.Series([0]*len(df)))).abs() * -1
+    df["Entrada(R$)"] = _clean_valor(_get_col(df, "entrada", default=0))
+    df["Saída(R$)"]   = _clean_valor(_get_col(df, "saída", "saida", default=0)).abs() * -1
     df["CC"]          = "C6"
     return df[["Data Lançamento", "DESCRIÇÃO", "Entrada(R$)", "Saída(R$)", "CC"]].dropna(subset=["Data Lançamento"])
 
@@ -96,15 +139,16 @@ def normalizar_bradesco(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_raw.copy()
     df.columns = df.columns.str.strip()
 
-    data_col = next((c for c in df.columns if "data" in c.lower()), df.columns[0])
+    data_col = _find_col(df.columns, "data") or df.columns[0]
     df["Data Lançamento"] = pd.to_datetime(df[data_col], dayfirst=True, errors="coerce")
 
-    titulo = df.get("Título", df.get("Titulo", pd.Series([""] * len(df)))).fillna("").astype(str).str.strip()
-    descr  = df.get("Descrição", df.get("Descricao", pd.Series([""] * len(df)))).fillna("").astype(str).str.strip()
-    df["DESCRIÇÃO"] = titulo.where(titulo == descr, titulo + " | " + descr).str.strip(" |")
+    titulo = _get_col(df, "título", "titulo").fillna("").astype(str).str.strip()
+    descr  = _get_col(df, "descriç", "descric").fillna("").astype(str).str.strip()
+    df["DESCRIÇÃO"] = (titulo + " | " + descr).str.strip(" |")
+    df["DESCRIÇÃO"] = df["DESCRIÇÃO"].str.replace(r"^\s*\|\s*|\s*\|\s*$", "", regex=True)
 
-    df["Entrada(R$)"] = _clean_valor(df.get("Entrada(R$)", pd.Series([0]*len(df))))
-    df["Saída(R$)"]   = _clean_valor(df.get("Saída(R$)",   pd.Series([0]*len(df)))).abs() * -1
+    df["Entrada(R$)"] = _clean_valor(_get_col(df, "entrada", default=0))
+    df["Saída(R$)"]   = _clean_valor(_get_col(df, "saída", "saida", default=0)).abs() * -1
     df["CC"]          = "BRADESCO"
     return df[["Data Lançamento", "DESCRIÇÃO", "Entrada(R$)", "Saída(R$)", "CC"]].dropna(subset=["Data Lançamento"])
 
@@ -113,27 +157,25 @@ def normalizar_nubank(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
     Nubank CSV exporta: Data | Descrição | Valor
     Valor positivo = entrada, negativo = saída.
+    Também suporta as colunas Entrada(R$) / Saída(R$) da RAW_NUBANK.
     """
     df = df_raw.copy()
     df.columns = df.columns.str.strip()
 
-    # Suporta 'Data Lançamento' (como está na RAW_NUBANK) ou 'Data' (CSV original)
-    data_col = next((c for c in df.columns if "data" in c.lower()), df.columns[0])
+    data_col = _find_col(df.columns, "data") or df.columns[0]
     df["Data Lançamento"] = pd.to_datetime(df[data_col], dayfirst=True, errors="coerce")
 
-    desc_col = next((c for c in df.columns if "descri" in c.lower()), df.columns[1])
+    desc_col = _find_col(df.columns, "descriç", "descric") or df.columns[1]
     df["DESCRIÇÃO"] = df[desc_col].fillna("").astype(str).str.strip()
 
-    # Suporta coluna 'Valor' (CSV Nubank) ou colunas separadas Entrada/Saída
-    if "Valor" in df.columns:
-        valor = _clean_valor(df["Valor"])
+    valor_col = _find_col(df.columns, "valor")
+    if valor_col:
+        valor = _clean_valor(df[valor_col])
         df["Entrada(R$)"] = valor.clip(lower=0)
         df["Saída(R$)"]   = valor.clip(upper=0)
     else:
-        entr_col = next((c for c in df.columns if "entrada" in c.lower()), None)
-        said_col = next((c for c in df.columns if "saída" in c.lower() or "saida" in c.lower()), None)
-        df["Entrada(R$)"] = _clean_valor(df[entr_col]) if entr_col else 0
-        df["Saída(R$)"]   = _clean_valor(df[said_col]).abs() * -1 if said_col else 0
+        df["Entrada(R$)"] = _clean_valor(_get_col(df, "entrada", default=0))
+        df["Saída(R$)"]   = _clean_valor(_get_col(df, "saída", "saida", default=0)).abs() * -1
 
     df["CC"] = "NUBANK"
     return df[["Data Lançamento", "DESCRIÇÃO", "Entrada(R$)", "Saída(R$)", "CC"]].dropna(subset=["Data Lançamento"])
@@ -141,31 +183,31 @@ def normalizar_nubank(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 def normalizar_inter(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Inter CSV exporta formato similar ao Nubank:
-    Data Lançamento | Descrição | Entrada(R$) | Saída(R$)
-    ou: Data | Histórico | Valor
+    Inter exporta: Data Lançamento | Histórico | Descrição | Valor | Saldo
+    Valor positivo = entrada, negativo = saída.
+    Junta Histórico + Descrição como DESCRIÇÃO.
     """
     df = df_raw.copy()
     df.columns = df.columns.str.strip()
 
-    data_col = next((c for c in df.columns if "data" in c.lower()), df.columns[0])
+    data_col = _find_col(df.columns, "data") or df.columns[0]
     df["Data Lançamento"] = pd.to_datetime(df[data_col], dayfirst=True, errors="coerce")
 
-    desc_col = next(
-        (c for c in df.columns if any(k in c.lower() for k in ["descri", "histór", "histor", "título", "titulo"])),
-        df.columns[1]
-    )
-    df["DESCRIÇÃO"] = df[desc_col].fillna("").astype(str).str.strip()
+    # Histórico é o tipo da transação; Descrição é o detalhe — junta os dois
+    historico = _get_col(df, "históric", "histor").fillna("").astype(str).str.strip()
+    descricao = _get_col(df, "descriç", "descric").fillna("").astype(str).str.strip()
+    df["DESCRIÇÃO"] = (historico + " | " + descricao).str.strip(" |")
+    df["DESCRIÇÃO"] = df["DESCRIÇÃO"].str.replace(r"^\s*\|\s*|\s*\|\s*$", "", regex=True)
 
-    if "Valor" in df.columns:
-        valor = _clean_valor(df["Valor"])
+    # Inter usa coluna única "Valor": positivo = crédito, negativo = débito
+    valor_col = _find_col(df.columns, "valor")
+    if valor_col:
+        valor = _clean_valor(df[valor_col])
         df["Entrada(R$)"] = valor.clip(lower=0)
         df["Saída(R$)"]   = valor.clip(upper=0)
     else:
-        entr_col = next((c for c in df.columns if "entrada" in c.lower()), None)
-        said_col = next((c for c in df.columns if "saída" in c.lower() or "saida" in c.lower()), None)
-        df["Entrada(R$)"] = _clean_valor(df[entr_col]) if entr_col else 0
-        df["Saída(R$)"]   = _clean_valor(df[said_col]).abs() * -1 if said_col else 0
+        df["Entrada(R$)"] = _clean_valor(_get_col(df, "entrada", default=0))
+        df["Saída(R$)"]   = _clean_valor(_get_col(df, "saída", "saida", default=0)).abs() * -1
 
     df["CC"] = "INTER"
     return df[["Data Lançamento", "DESCRIÇÃO", "Entrada(R$)", "Saída(R$)", "CC"]].dropna(subset=["Data Lançamento"])
@@ -237,15 +279,28 @@ def deduplicate(df_existing: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ler_raw_sheet(xl: pd.ExcelFile, banco: str) -> pd.DataFrame:
-    """Lê a aba RAW_{banco}, pulando a linha de instrução (linha 1)."""
+    """
+    Lê a aba RAW_{banco}.
+    Linha 1 = instrução (ignorada), Linha 2 = cabeçalho, Linha 3+ = dados.
+    Retorna DataFrame vazio se não houver dados.
+    """
     sheet = f"RAW_{banco}"
     if sheet not in xl.sheet_names:
-        raise ValueError(f"Aba '{sheet}' não encontrada em {xl.io}")
-    # Linha 1 = instrução, Linha 2 = cabeçalho, Linha 3+ = dados
-    df = pd.read_excel(xl, sheet_name=sheet, header=1, skiprows=[0])
-    df.columns = df.columns.str.strip()
-    df = df.dropna(how="all")
-    return df
+        raise ValueError(f"Aba '{sheet}' não encontrada.")
+
+    df_raw = pd.read_excel(xl, sheet_name=sheet, header=None)
+    df_raw = df_raw.dropna(how="all")
+
+    if len(df_raw) < 3:
+        return pd.DataFrame()
+
+    header_row = df_raw.iloc[1].tolist()
+    data_rows  = df_raw.iloc[2:].reset_index(drop=True)
+    data_rows.columns = [str(h).strip() if isinstance(h, str) else h for h in header_row]
+    data_rows = data_rows.loc[:, data_rows.columns.notna()]
+    data_rows = data_rows.loc[:, [c for c in data_rows.columns if str(c).strip() not in ("nan", "None", "")]]
+    data_rows = data_rows.dropna(how="all")
+    return data_rows
 
 
 # ══════════════════════════════════════════════════════════════════════════════
